@@ -774,7 +774,7 @@ function getRandomBehavior(videoDuration, instanceId, videoType = 'regular') {
     scrollProbability: Math.random() * 0.3, // 0-30% chance to scroll
     commentScrollProbability: Math.random() * 0.2, // 0-20% chance to scroll comments
     volumeChangeProbability: Math.random() * 0.15, // 0-15% chance to change volume
-    pausePlayProbability: Math.random() * 0.1 // 0-10% chance to pause/play
+    pausePlayProbability: Math.random() * 0.05 // 0-10% chance to pause/play
   };
   
   // Adjust behavior based on video type
