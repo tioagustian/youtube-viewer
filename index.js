@@ -27,16 +27,19 @@ function findChromePath() {
     let chromePath = null;
     
     if (platform === 'win32') {
-      // Windows paths
+      // Windows paths - prioritize regular Chrome over Chromium
       const possiblePaths = [
+        // Regular Chrome paths (preferred)
         'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
         'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
         process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
         process.env.PROGRAMFILES + '\\Google\\Chrome\\Application\\chrome.exe',
         process.env['PROGRAMFILES(X86)'] + '\\Google\\Chrome\\Application\\chrome.exe',
-        process.env.LOCALAPPDATA + '\\Google\\Chrome SxS\\Application\\chrome.exe',
+        process.env.USERPROFILE + '\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe',
+        
+        // Chromium paths (fallback)
         process.env.LOCALAPPDATA + '\\Chromium\\Application\\chrome.exe',
-        process.env.USERPROFILE + '\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'
+        process.env.LOCALAPPDATA + '\\Google\\Chrome SxS\\Application\\chrome.exe'
       ];
       
       for (const path of possiblePaths) {
@@ -46,7 +49,7 @@ function findChromePath() {
         }
       }
     } else if (platform === 'linux') {
-      // Linux - use which command
+      // Linux - preferring Google Chrome over Chromium
       try {
         chromePath = execSync('which google-chrome').toString().trim();
       } catch (e) {
@@ -61,7 +64,7 @@ function findChromePath() {
         }
       }
     } else if (platform === 'darwin') {
-      // MacOS paths
+      // MacOS paths - prioritize regular Chrome over Chromium
       const possiblePaths = [
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         '/Applications/Chromium.app/Contents/MacOS/Chromium'
@@ -76,7 +79,11 @@ function findChromePath() {
     }
     
     if (chromePath) {
-      console.log(`Detected Chrome at: ${chromePath}`);
+      // Check if path contains "chrome" to detect if this is a regular Chrome or Chromium
+      const isRegularChrome = chromePath.toLowerCase().includes('google chrome') || 
+                             (chromePath.toLowerCase().includes('chrome') && !chromePath.toLowerCase().includes('chromium'));
+      
+      console.log(`Detected ${isRegularChrome ? 'Google Chrome' : 'Chromium'} at: ${chromePath}`);
     } else {
       console.log('Chrome executable not found. Using Puppeteer bundled Chromium.');
     }
@@ -255,6 +262,30 @@ const argv = yargs(hideBin(process.argv))
     type: 'boolean',
     default: true
   })
+  .option('linuxCompatMode', {
+    description: 'Use enhanced compatibility mode for Linux systems with strict CSP',
+    type: 'boolean',
+    default: false
+  })
+  .option('minimalHeadless', {
+    description: 'Use minimal headless mode with fewer features but better stability',
+    type: 'boolean',
+    default: false
+  })
+  .option('winSafeMode', {
+    description: 'Windows-specific safe mode to prevent STATUS_ACCESS_VIOLATION errors',
+    type: 'boolean',
+    default: false
+  })
+  .option('useFirefox', {
+    description: 'Use Firefox instead of Chrome (for systems where Chrome has persistent issues)',
+    type: 'boolean',
+    default: false
+  })
+  .option('firefoxPath', {
+    description: 'Custom path to Firefox executable',
+    type: 'string'
+  })
   .help()
   .argv;
 
@@ -276,7 +307,10 @@ const ignorableErrors = [
   'The AudioContext was not allowed to start',
   'Cannot redefine property',
   'property descriptor',
-  'Permission denied'
+  'Permission denied',
+  'Trusted Type',
+  'violates CSP',
+  'Content Security Policy'
 ];
 
 // Helper function to check if an error can be ignored
@@ -286,6 +320,24 @@ function isIgnorableError(errorMessage) {
   return ignorableErrors.some(errText => 
     errorMessage.toLowerCase().includes(errText.toLowerCase())
   );
+}
+
+// Display recommendations for persistent STATUS_ACCESS_VIOLATION errors
+function displayStatusAccessViolationHelp() {
+  console.log(`\n========== CHROME STATUS_ACCESS_VIOLATION HELP ==========`);
+  console.log(`It appears you're experiencing persistent STATUS_ACCESS_VIOLATION errors with Chrome/Chromium.`);
+  console.log(`This is a known issue with Chrome on certain Windows systems, especially with specific hardware configurations.`);
+  console.log(`\nTry the following solutions in order:`);
+  console.log(`1. Use the Windows safe mode: --winSafeMode`);
+  console.log(`2. Run with the regular safe mode as well: --winSafeMode --safeMode`);
+  console.log(`3. Disable headless mode: --winSafeMode --safeMode --headless false`);
+  console.log(`4. Try running as Administrator (open command prompt as Admin)`);
+  console.log(`5. Install Firefox and add puppeteer-firefox dependency:`);
+  console.log(`   npm install puppeteer-firefox`);
+  console.log(`   Then run with: --useFirefox`);
+  console.log(`\nExample command for maximum compatibility:`);
+  console.log(`node index.js --url YOUR_URL --winSafeMode --safeMode --headless false`);
+  console.log(`==================================================\n`);
 }
 
 // Shared state to track viewed videos across instances
@@ -648,53 +700,35 @@ function getRandomViewport() {
 // Function to get video duration
 async function getVideoDuration(page, instanceId) {
   try {
-    // Try to get the video duration
-    const duration = await page.evaluate(() => {
-      return new Promise((resolve) => {
-        // Initial check
-        const checkDuration = () => {
-          const video = document.querySelector('video');
-          if (video && video.duration && !isNaN(video.duration) && video.duration > 0) {
-            resolve(video.duration);
-          } else {
-            // Check again in 1 second
-            setTimeout(checkDuration, 1000);
-          }
-        };
+    const duration = await safeEvaluate(page, () => {
+      // Try various selectors to find the duration element
+      const videoElement = document.querySelector('video');
+      if (videoElement && !isNaN(videoElement.duration)) {
+        return videoElement.duration;
+      }
+      
+      // Get duration from time display
+      const timeDisplay = document.querySelector('.ytp-time-duration');
+      if (timeDisplay) {
+        const timeText = timeDisplay.textContent || '';
+        const timeParts = timeText.split(':').map(Number);
         
-        // Start checking
-        checkDuration();
-        
-        // Fallback - if we haven't found duration after 20 seconds, try alternative method
-        setTimeout(() => {
-          const durationText = document.querySelector('.ytp-time-duration')?.textContent;
-          if (durationText) {
-            // Parse mm:ss or hh:mm:ss format
-            const parts = durationText.split(':').map(Number);
-            if (parts.length === 2) { // mm:ss
-              resolve(parts[0] * 60 + parts[1]);
-            } else if (parts.length === 3) { // hh:mm:ss
-              resolve(parts[0] * 3600 + parts[1] * 60 + parts[2]);
-            } else {
-              resolve(null); // Couldn't parse
-            }
-          } else {
-            resolve(null); // Couldn't find duration element
-          }
-        }, 20000);
-      });
+        if (timeParts.length === 3) { // hours:minutes:seconds
+          return timeParts[0] * 3600 + timeParts[1] * 60 + timeParts[2];
+        } else if (timeParts.length === 2) { // minutes:seconds
+          return timeParts[0] * 60 + timeParts[1];
+        }
+      }
+      
+      // Default duration if nothing found
+      return 300; // 5 minutes default
     });
     
-    if (duration && duration > 0) {
-      console.log(`[Instance ${instanceId}] 🕒 Video duration detected: ${Math.floor(duration / 60)}m ${Math.floor(duration % 60)}s`);
-      return duration;
-    } else {
-      console.log(`[Instance ${instanceId}] ⚠️ Could not detect video duration`);
-      return null;
-    }
+    console.log(`[Instance ${instanceId}] Video duration: ${duration} seconds`);
+    return duration;
   } catch (error) {
-    console.error(`[Instance ${instanceId}] Error getting video duration:`, error.message);
-    return null;
+    console.error(`[Instance ${instanceId}] Error getting video duration: ${error.message}`);
+    return 300; // Default to 5 minutes on error
   }
 }
 
@@ -764,7 +798,7 @@ function getRandomBehavior(videoDuration, instanceId, videoType = 'regular') {
 
 // Random delay function to simulate human behavior
 function randomDelay(min, max) {
-  const delay = Math.floor(min + Math.random() * (max - min));
+  const delay = Math.floor(Math.random() * (max - min + 1)) + min;
   return new Promise(resolve => setTimeout(resolve, delay));
 }
 
@@ -776,6 +810,86 @@ function isChannelUrl(url) {
          url.includes('/@');
 }
 
+// Safe evaluate function to handle Trusted Types policies
+async function safeEvaluate(page, fn) {
+  try {
+    // Add Trusted Types policy handler to the page if not already added
+    await page.evaluateOnNewDocument(() => {
+      if (!window.trustedTypes) {
+        // Create a mock Trusted Types API if not supported
+        window.trustedTypes = {
+          createPolicy: (name, rules) => rules
+        };
+      }
+      
+      // Create a policy that allows script execution
+      window.trustedTypesPolicy = window.trustedTypes.createPolicy('youtube-viewer-policy', {
+        createScript: (script) => script,
+        createHTML: (html) => html,
+        createScriptURL: (url) => url
+      });
+    });
+    
+    // Execute function with Trusted Types support
+    return await page.evaluate(fn);
+  } catch (error) {
+    // Handle Trusted Types errors
+    if (error.message.includes('Trusted Type') || error.message.includes('trustedTypes')) {
+      console.error('Trusted Types error detected, trying alternative approach');
+      
+      // Fall back to a basic evaluate if the advanced method fails
+      return await page.evaluate(fn);
+    }
+    
+    // Re-throw other errors
+    throw error;
+  }
+}
+
+// Function to safely extract videos from the current page
+async function safeExtractVideosFromPage(page) {
+  // Use our safe evaluation helper to handle Trusted Types policies
+  return await safeEvaluate(page, () => {
+    const results = [];
+    
+    // Get all possible video links more safely
+    const videoElements = Array.from(document.querySelectorAll('a[href*="/watch?v="], a[href*="/shorts/"]'));
+    
+    videoElements.forEach(element => {
+      if (!element || !element.href) return; // Skip invalid elements
+      
+      const href = element.href || '';
+      // Get title safely
+      const title = element.getAttribute('title') || element.innerText || element.textContent || 'Unknown';
+      
+      if (href && (href.includes('/watch?v=') || href.includes('/shorts/'))) {
+        // Determine video type based on containers or other indicators
+        let videoType = 'regular';
+        
+        // Determine if it's a short
+        if (href.includes('/shorts/')) {
+          videoType = 'short';
+        } 
+        // Check for live indicators
+        else if ((element.querySelector('[class*="live"]') !== null) || 
+                (element.closest('[class*="live"]') !== null) ||
+                title.toLowerCase().includes('live') ||
+                (element.closest('[class*="badge-style-type-live"]') !== null)) {
+          videoType = 'live';
+        }
+        
+        results.push({
+          url: href,
+          title: title.trim(),
+          type: videoType
+        });
+      }
+    });
+    
+    return results;
+  });
+}
+
 // Function to extract videos from a channel page
 async function extractVideosFromChannel(page, maxVideos = 20) {
   console.log(`Extracting videos from channel...`);
@@ -783,115 +897,74 @@ async function extractVideosFromChannel(page, maxVideos = 20) {
   // Track all found videos with their types
   const allVideos = [];
   
-  // Function to extract videos from current page
-  async function extractCurrentPageVideos() {
-    // Extract video information (URLs and titles)
-    return await page.evaluate(() => {
-      const videoElements = document.querySelectorAll('a#video-title-link, a#video-title, a[href*="/watch?v="]');
-      const results = [];
-      
-      videoElements.forEach(element => {
-        const href = element.href;
-        const title = element.getAttribute('title') || element.textContent.trim();
-        
-        if (href && href.includes('/watch?v=')) {
-          // Determine video type based on containers or other indicators
-          let videoType = 'regular';
-          
-          // Check if it's a short or live
-          if (href.includes('/shorts/') || 
-              element.closest('[title*="short"]') || 
-              element.closest('[class*="short"]') ||
-              element.closest('[id*="shorts"]')) {
-            videoType = 'short';
-          } else if (element.querySelector('[class*="live"]') || 
-                     element.closest('[class*="live"]') ||
-                     title.toLowerCase().includes('live') ||
-                     element.closest('[class*="badge-style-type-live"]')) {
-            videoType = 'live';
-          }
-          
-          results.push({
-            url: href,
-            title: title,
-            type: videoType
-          });
-        }
-      });
-      
-      return results;
-    });
-  }
-  
   // Extract from Videos tab
   console.log('Looking for videos in Videos tab...');
   try {
-    // Navigate to Videos tab
-    const videosTabUrl = new URL(await page.url());
-    if (!videosTabUrl.pathname.endsWith('/videos')) {
-      videosTabUrl.pathname = videosTabUrl.pathname.replace(/\/$/, '') + '/videos';
-      await page.goto(videosTabUrl.toString(), { waitUntil: 'networkidle2', timeout: 30000 });
-    }
+    // We're already on the Videos tab from the navigation function
     
-    // Scroll down to load more videos
+    // Scroll down to load more videos - using a safer approach
     for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => {
-        window.scrollBy(0, window.innerHeight * 3);
-      });
+      await safeEvaluate(page, () => window.scrollBy(0, window.innerHeight * 3));
       await randomDelay(1000, 2000);
     }
     
-    const regularVideos = await extractCurrentPageVideos();
+    const regularVideos = await safeExtractVideosFromPage(page);
     console.log(`Found ${regularVideos.length} videos in Videos tab`);
-    allVideos.push(...regularVideos.map(v => ({ ...v, type: 'regular' })));
+    allVideos.push(...regularVideos);
   } catch (error) {
     console.error(`Error extracting from Videos tab: ${error.message}`);
   }
   
-  // Extract from Shorts tab
-  console.log('Looking for videos in Shorts tab...');
-  try {
-    // Navigate to Shorts tab
-    const shortsTabUrl = new URL(await page.url());
-    shortsTabUrl.pathname = shortsTabUrl.pathname.replace(/\/videos\/?$/, '').replace(/\/$/, '') + '/shorts';
-    await page.goto(shortsTabUrl.toString(), { waitUntil: 'networkidle2', timeout: 30000 });
-    
-    // Scroll down to load more shorts
-    for (let i = 0; i < 2; i++) {
-      await page.evaluate(() => {
-        window.scrollBy(0, window.innerHeight * 3);
-      });
-      await randomDelay(1000, 2000);
+  // Extract from Shorts tab if enabled
+  if (argv.includeShorts) {
+    console.log('Looking for videos in Shorts tab...');
+    try {
+      // Navigate to Shorts tab
+      const shortsTabUrl = new URL(await page.url());
+      shortsTabUrl.pathname = shortsTabUrl.pathname.replace(/\/videos\/?$/, '').replace(/\/$/, '') + '/shorts';
+      
+      await navigateWithRetries(page, shortsTabUrl.toString(), 'Channel');
+      
+      // Scroll down to load more shorts - using a safer approach
+      for (let i = 0; i < 2; i++) {
+        await safeEvaluate(page, () => window.scrollBy(0, window.innerHeight * 3));
+        await randomDelay(1000, 2000);
+      }
+      
+      const shorts = await safeExtractVideosFromPage(page);
+      console.log(`Found ${shorts.length} videos in Shorts tab`);
+      allVideos.push(...shorts);
+    } catch (error) {
+      console.error(`Error extracting from Shorts tab: ${error.message}`);
     }
-    
-    const shorts = await extractCurrentPageVideos();
-    console.log(`Found ${shorts.length} videos in Shorts tab`);
-    allVideos.push(...shorts.map(v => ({ ...v, type: 'short' })));
-  } catch (error) {
-    console.error(`Error extracting from Shorts tab: ${error.message}`);
+  } else {
+    console.log('Skipping Shorts tab (disabled)');
   }
   
-  // Extract from Live tab
-  console.log('Looking for videos in Live tab...');
-  try {
-    // Navigate to Live tab
-    const liveTabUrl = new URL(await page.url());
-    liveTabUrl.pathname = liveTabUrl.pathname.replace(/\/shorts\/?$/, '').replace(/\/$/, '') + '/streams';
-    await page.goto(liveTabUrl.toString(), { waitUntil: 'networkidle2', timeout: 30000 });
-    
-    // Scroll down to load more streams
-    for (let i = 0; i < 2; i++) {
-      await page.evaluate(() => {
-        window.scrollBy(0, window.innerHeight * 3);
-      });
-      await randomDelay(1000, 2000);
+  // Extract from Live tab if enabled
+  if (argv.includeLive) {
+    console.log('Looking for videos in Live tab...');
+    try {
+      // Navigate to Live tab (now called streams)
+      const liveTabUrl = new URL(await page.url());
+      liveTabUrl.pathname = liveTabUrl.pathname.replace(/\/shorts\/?$/, '').replace(/\/$/, '') + '/streams';
+      
+      await navigateWithRetries(page, liveTabUrl.toString(), 'Channel');
+      
+      // Scroll down to load more streams - using a safer approach
+      for (let i = 0; i < 2; i++) {
+        await safeEvaluate(page, () => window.scrollBy(0, window.innerHeight * 3));
+        await randomDelay(1000, 2000);
+      }
+      
+      const liveVideos = await safeExtractVideosFromPage(page);
+      console.log(`Found ${liveVideos.length} videos in Live tab`);
+      allVideos.push(...liveVideos);
+    } catch (error) {
+      console.error(`Error extracting from Live tab: ${error.message}`);
     }
-    
-    const liveVideos = await extractCurrentPageVideos();
-    console.log(`Found ${liveVideos.length} videos in Live tab`);
-    allVideos.push(...liveVideos.map(v => ({ ...v, type: 'live' })));
-  } catch (error) {
-    console.error(`Error extracting from Live tab: ${error.message}`);
+  } else {
+    console.log('Skipping Live tab (disabled)');
   }
   
   // Remove duplicates based on URL
@@ -923,144 +996,107 @@ async function extractVideosFromChannel(page, maxVideos = 20) {
 // Function to detect and skip YouTube ads
 async function checkAndSkipAds(page, instanceId) {
   try {
-    // Check if ad is playing by looking for skip ad button or ad overlay
-    const isAdPlaying = await page.evaluate(() => {
-      // Common ad indicators
-      const skipButton = document.querySelector('.ytp-ad-skip-button-container, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');
-      const adOverlay = document.querySelector('.ytp-ad-player-overlay, .video-ads, .ytp-ad-text');
-      const adText = document.querySelector('.ytp-ad-text, .ytp-ad-preview-text');
+    // Check if ad is playing
+    const isAdPlaying = await safeEvaluate(page, () => {
+      // Check multiple indicators for ads
+      const adIndicators = [
+        '.ad-showing', // Class on video player during ads
+        '.ytp-ad-player-overlay', // Ad overlay element
+        '.html5-video-player.ad-created', // Another ad class
+        '.ytp-ad-text', // Ad text overlay
+        '.ytp-ad-preview-container' // Ad preview container
+      ];
       
-      // More specific ad indicators to reduce false positives
-      const adBadge = document.querySelector('.ytp-ad-button-text, .ytp-ad-visit-advertiser-button');
-      const adIndicator = document.querySelector('.ad-showing');
-      
-      // Some ads have countdown indicators
-      const adCountdown = document.querySelector('.ytp-ad-duration-remaining');
-      
-      // Require at least two indicators to confirm it's really an ad to avoid false positives
-      let adSignalsCount = 0;
-      if (skipButton) adSignalsCount++;
-      if (adOverlay) adSignalsCount++;
-      if (adText) adSignalsCount++;
-      if (adBadge) adSignalsCount++;
-      if (adIndicator) adSignalsCount++;
-      if (adCountdown) adSignalsCount++;
-      
-      // Require at least one primary indicator (skipButton, adOverlay, adIndicator) and one secondary
-      // or at least two primary indicators to reduce false positives
-      return (adSignalsCount >= 2) && (skipButton || adOverlay || adIndicator);
+      // Check if any ad indicators exist
+      return adIndicators.some(selector => document.querySelector(selector) !== null);
     });
     
     if (isAdPlaying) {
-      console.log(`[Instance ${instanceId}] 🔍 Advertisement detected...`);
+      console.log(`[Instance ${instanceId}] 🔄 Ad detected, attempting to skip...`);
       
-      // Try to skip the ad if possible
-      const wasSkipped = await page.evaluate(() => {
-        // Try to click any skip button that might be available
+      // Try to find and click the skip button
+      const wasSkipped = await safeEvaluate(page, () => {
         const skipButtons = [
-          '.ytp-ad-skip-button-container button',
-          '.ytp-ad-skip-button',
-          '.ytp-ad-skip-button-modern',
-          '.videoAdUiSkipButton',
-          '[class*="skip"][class*="button"]',
-          '[class*="skipButton"]',
-          '[data-skip-ad]',
-          '[aria-label*="Skip"]'
+          '.ytp-ad-skip-button', // Main skip button
+          '.ytp-ad-skip-button-modern', // New skip button design
+          '.ytp-skip-ad-button', // Alternative skip button
+          '.videoAdUiSkipButton', // Another skip button variation
+          '[data-is-ad-button="true"]' // Generic ad button
         ];
         
-        // Try each type of skip button
+        // Try all skip buttons
         for (const selector of skipButtons) {
-          const button = document.querySelector(selector);
-          if (button && button.offsetParent !== null) { // Check if visible
-            button.click();
-            return true;
-          }
-        }
-        
-        // If can't skip, try to mute it
-        const muteButton = document.querySelector('.ytp-mute-button');
-        if (muteButton) {
-          const isMuted = muteButton.getAttribute('aria-label').toLowerCase().includes('unmute');
-          if (!isMuted) {
-            muteButton.click();
-            return false; // Not skipped, but muted
-          }
-        }
-        
-        return false; // Couldn't skip or already muted
-      });
-      
-      if (wasSkipped) {
-        console.log(`[Instance ${instanceId}] ⏭️ Advertisement skipped!`);
-      } else {
-        console.log(`[Instance ${instanceId}] 🔇 Advertisement could not be skipped - muted instead`);
-        
-        // If we couldn't skip, wait a bit and try again
-        await randomDelay(2000, 3000);
-        
-        // Try clicking skip button again after a delay
-        const retrySkip = await page.evaluate(() => {
-          const skipButton = document.querySelector('.ytp-ad-skip-button-container button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');
-          if (skipButton && skipButton.offsetParent !== null) {
+          const skipButton = document.querySelector(selector);
+          if (skipButton) {
             skipButton.click();
             return true;
           }
-          return false;
-        });
+        }
         
-        if (retrySkip) {
-          console.log(`[Instance ${instanceId}] ⏭️ Advertisement skipped on second attempt!`);
-        } else {
-          // If still can't skip, just wait for the ad to finish
-          console.log(`[Instance ${instanceId}] ⏱️ Waiting for advertisement to finish...`);
-          
-          // Some ads have a small "i" info button we can click and then choose "stop seeing this ad"
-          const closedAd = await page.evaluate(() => {
-            try {
-              // Try clicking the info button
-              const infoButton = document.querySelector('.ytp-ad-info-dialog-mute-button, .ytp-ad-info-icon-container');
-              if (infoButton) {
-                infoButton.click();
-                
-                // Wait for dialog to appear
-                setTimeout(() => {
-                  // Try clicking "stop seeing this ad" or similar option
-                  const stopButton = document.querySelector('[class*="stop"],[class*="feedback"],[class*="close"]');
-                  if (stopButton) {
-                    stopButton.click();
-                    
-                    // If another confirmation appears, click it too
-                    setTimeout(() => {
-                      const confirmButton = document.querySelector('[class*="confirm"],[class*="submit"],[class*="send"]');
-                      if (confirmButton) {
-                        confirmButton.click();
-                      }
-                    }, 500);
-                    
-                    return true;
-                  }
-                }, 500);
-                
-                return true;
-              }
-              return false;
-            } catch (e) {
-              return false;
-            }
+        return false;
+      });
+      
+      if (wasSkipped) {
+        console.log(`[Instance ${instanceId}] ✅ Ad skipped successfully`);
+      } else {
+        console.log(`[Instance ${instanceId}] ⚠️ Skip button not found yet, trying alternative methods...`);
+        
+        // If skipping fails, try additional methods
+        try {
+          // Try to skip using more aggressive methods
+          const retrySkip = await safeEvaluate(page, () => {
+            // Try clicking any element that might skip ads
+            const potentialSkipElements = document.querySelectorAll('[class*="skip" i], [class*="ad" i] button, [data-is-ad="true"] button');
+            let clicked = false;
+            
+            potentialSkipElements.forEach(element => {
+              // Skip non-visible elements
+              if (!element.offsetParent) return;
+              
+              // Try to click the element
+              element.click();
+              clicked = true;
+            });
+            
+            return clicked;
           });
           
-          if (closedAd) {
-            console.log(`[Instance ${instanceId}] 🚫 Attempted to close advertisement using feedback options`);
+          if (retrySkip) {
+            console.log(`[Instance ${instanceId}] ✅ Ad skipped with alternative method`);
+          } else {
+            // If still can't skip, try closing overlay ads
+            const closedAd = await safeEvaluate(page, () => {
+              const closeButtons = document.querySelectorAll('.ytp-ad-overlay-close-button, [class*="close" i][class*="ad" i]');
+              let closed = false;
+              
+              closeButtons.forEach(button => {
+                button.click();
+                closed = true;
+              });
+              
+              return closed;
+            });
+            
+            if (closedAd) {
+              console.log(`[Instance ${instanceId}] ✅ Closed ad overlay`);
+            } else {
+              // If ad can't be skipped, wait a bit and let it play
+              console.log(`[Instance ${instanceId}] ⏳ Ad can't be skipped, waiting for it to finish...`);
+              // Wait a bit before next check
+              await randomDelay(2000, 3000);
+            }
           }
+        } catch (skipError) {
+          console.error(`[Instance ${instanceId}] Error during advanced ad skipping:`, skipError.message);
         }
       }
       
-      return true; // Ad was detected, whether or not it was skipped
+      return true; // Ad was detected (even if not skipped)
     }
     
     return false; // No ad detected
   } catch (error) {
-    console.error(`[Instance ${instanceId}] Error checking for ads: ${error.message}`);
+    console.error(`[Instance ${instanceId}] Error checking for ads:`, error.message);
     return false;
   }
 }
@@ -1069,37 +1105,43 @@ async function checkAndSkipAds(page, instanceId) {
 async function checkAndFixPlaybackErrors(page, instanceId) {
   try {
     // Check for various error messages
-    const hasError = await page.evaluate(() => {
-      // Common error indicators
-      const errorMessage = document.querySelector('.ytp-error, .ytp-error-content-wrap-reason');
-      const errorOverlay = document.querySelector('.html5-video-player.ytp-error');
-      const errorIcon = document.querySelector('.ytp-error-content-wrap-icon');
-      
-      // Specific error text
-      const errorTexts = [
-        'something went wrong',
-        'refresh',
-        'try again',
-        'error occurred',
-        'playback error',
-        'video unavailable'
-      ];
-      
-      // Check if error message contains any of the error texts
-      if (errorMessage) {
-        const messageText = errorMessage.textContent.toLowerCase();
-        return errorTexts.some(text => messageText.includes(text));
+    const hasError = await safeEvaluate(page, () => {
+      try {
+        // Common error indicators
+        const errorMessage = document.querySelector('.ytp-error, .ytp-error-content-wrap-reason');
+        const errorOverlay = document.querySelector('.html5-video-player.ytp-error');
+        const errorIcon = document.querySelector('.ytp-error-content-wrap-icon');
+        
+        // Specific error text
+        const errorTexts = [
+          'something went wrong',
+          'refresh',
+          'try again',
+          'error occurred',
+          'playback error',
+          'video unavailable'
+        ];
+        
+        // Check if error message contains any of the error texts
+        if (errorMessage) {
+          const messageText = errorMessage.textContent ? errorMessage.textContent.toLowerCase() : '';
+          return errorTexts.some(text => messageText.includes(text));
+        }
+        
+        // Check for visual error indicators
+        return !!errorOverlay || !!errorIcon;
+      } catch (error) {
+        // Handle errors during error detection
+        console.error("Error checking for playback issues:", error.message);
+        return false;
       }
-      
-      // Check for visual error indicators
-      return !!errorOverlay || !!errorIcon;
     });
     
     if (hasError) {
       console.log(`[Instance ${instanceId}] 🛑 Video playback error detected. Attempting to fix...`);
       
       // Try refreshing the player
-      const wasFixed = await page.evaluate(() => {
+      const wasFixed = await safeEvaluate(page, () => {
         try {
           // Try clicking any retry/refresh button
           const retryButtons = [
@@ -1140,7 +1182,7 @@ async function checkAndFixPlaybackErrors(page, instanceId) {
           console.log(`[Instance ${instanceId}] ✅ Page refreshed, video player reloaded`);
           
           // Try playing video again
-          await page.evaluate(() => {
+          await safeEvaluate(page, () => {
             const video = document.querySelector('video');
             if (video && video.paused) {
               video.play();
@@ -1194,7 +1236,7 @@ async function setupPlaybackMonitor(page, instanceId) {
       // Also check if video is actually playing
       if (!hadError) {
         // Verify video is actually playing
-        const isStalled = await page.evaluate(() => {
+        const isStalled = await safeEvaluate(page, () => {
           const video = document.querySelector('video');
           if (!video) return false;
           
@@ -1206,7 +1248,7 @@ async function setupPlaybackMonitor(page, instanceId) {
         
         if (isStalled) {
           console.log(`[Instance ${instanceId}] 🔍 Video appears to be stalled. Attempting to resume...`);
-          await page.evaluate(() => {
+          await safeEvaluate(page, () => {
             const video = document.querySelector('video');
             if (video) {
               // Try playing
@@ -1232,6 +1274,74 @@ async function setupPlaybackMonitor(page, instanceId) {
   return playbackCheckInterval;
 }
 
+// Function to navigate to a URL with retries
+async function navigateWithRetries(page, url, instanceId, maxRetries = 3) {
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      console.log(`[Instance ${instanceId}] Navigating to: ${url}${retries > 0 ? ` (attempt ${retries + 1}/${maxRetries})` : ''}`);
+      
+      await page.goto(url, { 
+        waitUntil: retries === 0 ? 'networkidle2' : 'domcontentloaded', // Fall back to domcontentloaded on retries
+        timeout: 60000 
+      });
+      
+      // Extra checks to verify page loaded properly
+      const pageTitle = await page.title().catch(() => '');
+      
+      // If we got an empty page or error page, throw error
+      if (pageTitle.includes('Error') || pageTitle === '') {
+        throw new Error('Received empty or error page');
+      }
+      
+      // Additional wait for YouTube to initialize
+      await page.waitForTimeout(2000);
+      
+      // Success
+      console.log(`[Instance ${instanceId}] Successfully loaded: ${url}`);
+      return true;
+    } catch (error) {
+      retries++;
+      console.error(`[Instance ${instanceId}] Navigation error (attempt ${retries}/${maxRetries}): ${error.message}`);
+      
+      if (retries >= maxRetries) {
+        console.error(`[Instance ${instanceId}] Failed to load URL after ${maxRetries} attempts: ${url}`);
+        throw error; // Re-throw the error to be handled by the caller
+      }
+      
+      // Wait before retry with increasing backoff
+      const backoff = 2000 * Math.pow(2, retries - 1); // 2s, 4s, 8s...
+      console.log(`[Instance ${instanceId}] Retrying in ${backoff / 1000} seconds...`);
+      await page.waitForTimeout(backoff);
+      
+      // For persistent errors, try cleaning up and refreshing the page
+      try {
+        console.log(`[Instance ${instanceId}] Clearing cache and cookies before retry...`);
+        await page.evaluate(() => {
+          try {
+            localStorage.clear();
+            sessionStorage.clear();
+          } catch (e) {
+            // Ignore storage access errors
+          }
+        });
+        await page.setCacheEnabled(false);
+      } catch (cleanupError) {
+        // Ignore cleanup errors
+      }
+    }
+  }
+}
+
+// Function to check if URL is a channel
+function isChannelUrl(url) {
+  return url.includes('/channel/') || 
+         url.includes('/c/') || 
+         url.includes('/user/') || 
+         url.includes('/@');
+}
+
 // YouTube viewer instance
 async function runYouTubeViewer(instanceId, proxyList) {
   let browser = null;
@@ -1242,197 +1352,410 @@ async function runYouTubeViewer(instanceId, proxyList) {
   try {
     console.log(`[Instance ${instanceId}] Starting...`);
     
-    // Determine Chrome path
-    let chromePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    if (argv.customChromePath) {
-      if (fs.existsSync(argv.customChromePath)) {
-        chromePath = argv.customChromePath;
-        console.log(`[Instance ${instanceId}] Using custom Chrome path: ${chromePath}`);
-      } else {
-        console.warn(`[Instance ${instanceId}] Custom Chrome path not found: ${argv.customChromePath}`);
+    // Determine browser to use - Chrome by default, Firefox if specified
+    if (argv.useFirefox) {
+      console.log(`[Instance ${instanceId}] Using Firefox instead of Chrome due to useFirefox option`);
+      console.warn(`[Instance ${instanceId}] WARNING: puppeteer-firefox is deprecated and no longer maintained.`);
+      console.warn(`[Instance ${instanceId}] Using Google Chrome is recommended instead for better stability.`);
+      
+      try {
+        // Try to load Firefox module
+        const firefoxLauncher = require('puppeteer-firefox');
+        console.log(`[Instance ${instanceId}] Firefox module found, configuring browser...`);
+        
+        // Configure Firefox browser options
+        const firefoxOptions = {
+          headless: argv.headless,
+          args: ['--width=1920', '--height=1080']
+        };
+        
+        // Use custom Firefox path if provided
+        if (argv.firefoxPath) {
+          firefoxOptions.executablePath = argv.firefoxPath;
+          console.log(`[Instance ${instanceId}] Using custom Firefox path: ${argv.firefoxPath}`);
+        }
+        
+        console.log(`[Instance ${instanceId}] Launching Firefox browser...`);
+        browser = await firefoxLauncher.launch(firefoxOptions);
+        console.log(`[Instance ${instanceId}] Firefox browser launched successfully`);
+      } catch (firefoxError) {
+        console.error(`[Instance ${instanceId}] Error launching Firefox: ${firefoxError.message}`);
+        console.error(`[Instance ${instanceId}] Falling back to Chrome/Chromium...`);
+        browser = null; // Ensure browser is null so we proceed with Chrome setup
       }
     }
     
-    // Build browser arguments based on options
-    const browserArgs = [];
-    
-    // Always add these basic args
-    browserArgs.push('--disable-infobars');
-    browserArgs.push('--window-size=1920,1080');
-    browserArgs.push('--disable-notifications');
-    browserArgs.push('--disable-extensions');
-    
-    // Conditional args based on user options
-    if (argv.noSandbox) {
-      browserArgs.push('--no-sandbox');
-      browserArgs.push('--disable-setuid-sandbox');
-    }
-    
-    if (argv.disableShm) {
-      browserArgs.push('--disable-dev-shm-usage');
-    }
-    
-    // Additional stability args (always added)
-    browserArgs.push('--disable-accelerated-2d-canvas');
-    browserArgs.push('--disable-gpu');
-    
-    // Safe mode - add all compatibility options
-    if (argv.safeMode) {
-      browserArgs.push('--disable-web-security');
-      browserArgs.push('--disable-features=site-per-process');
-      browserArgs.push('--disable-features=IsolateOrigins');
-      browserArgs.push('--disable-site-isolation-trials');
-      browserArgs.push('--disable-features=TranslateUI');
-      browserArgs.push('--disable-breakpad');
-      browserArgs.push('--disable-sync');
-      browserArgs.push('--disable-background-networking');
-      browserArgs.push('--disable-default-apps');
-      browserArgs.push('--disable-extensions');
-      browserArgs.push('--disable-component-extensions-with-background-pages');
-      browserArgs.push('--disable-backgrounding-occluded-windows');
-      browserArgs.push('--disable-component-update');
-      browserArgs.push('--metrics-recording-only');
-      browserArgs.push('--mute-audio');
-      browserArgs.push('--no-default-browser-check');
-      browserArgs.push('--no-first-run');
-      browserArgs.push('--password-store=basic');
-    } else {
-      // Just add mute audio if not in safe mode
-      browserArgs.push('--mute-audio');
-    }
-    
-    // Set up browser options with more robust error handling
-    const launchOptions = {
-      headless: argv.headless ? 'new' : false,
-      executablePath: chromePath || null, // Will use bundled Chromium if null
-      ignoreHTTPSErrors: true,
-      dumpio: false,
-      args: browserArgs
-    };
-    
-    // Add proxy if available
-    let proxySuccess = false;
-    let proxyRetries = 0;
-    const maxProxyRetries = 3;
-    
-    while (!proxySuccess && proxyRetries < maxProxyRetries) {
-      try {
-        if (proxyList.length > 0) {
-          const proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
-          launchOptions.args.push(`--proxy-server=${proxy}`);
-          console.log(`[Instance ${instanceId}] Using proxy: ${proxy}`);
-          
-          // If verification is disabled, assume proxy works
-          if (!argv.verifyProxies) {
-            console.log(`[Instance ${instanceId}] Proxy verification disabled. Assuming proxy works.`);
-            proxySuccess = true;
-            continue;
-          } else {
-            // Proxies have already been pre-verified in setupProxies
-            // So we can assume they work
-            proxySuccess = true;
-            continue;
-          }
+    // If Firefox wasn't used or failed to launch, use Chrome/Chromium
+    if (!browser) {
+      // Determine Chrome path
+      let chromePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+      if (argv.customChromePath) {
+        if (fs.existsSync(argv.customChromePath)) {
+          chromePath = argv.customChromePath;
+          console.log(`[Instance ${instanceId}] Using custom Chrome path: ${chromePath}`);
         } else {
-          if (argv.allowDirectConnection) {
-            console.log(`[Instance ${instanceId}] No proxies available. Running with direct connection.`);
-            proxySuccess = true; // No proxies to try, so continue without
-          } else {
-            console.error(`[Instance ${instanceId}] No proxies available and direct connections are not allowed. Stopping instance.`);
-            return; // Exit the function to stop this instance
-          }
+          console.warn(`[Instance ${instanceId}] Custom Chrome path not found: ${argv.customChromePath}`);
         }
-      } catch (error) {
-        console.error(`[Instance ${instanceId}] Error setting up proxy: ${error.message}`);
-        proxyRetries++;
+      } else {
+        // Auto-detect Chrome
+        chromePath = findChromePath();
+      }
+      
+      // Build browser arguments based on options
+      const browserArgs = [];
+      
+      // Always add these basic args
+      browserArgs.push('--disable-infobars');
+      browserArgs.push('--window-size=1920,1080');
+      browserArgs.push('--disable-notifications');
+      browserArgs.push('--disable-extensions');
+      
+      // Conditional args based on user options
+      if (argv.noSandbox) {
+        browserArgs.push('--no-sandbox');
+        browserArgs.push('--disable-setuid-sandbox');
+      }
+      
+      if (argv.disableShm) {
+        browserArgs.push('--disable-dev-shm-usage');
+      }
+      
+      // Additional stability args (always added)
+      browserArgs.push('--disable-accelerated-2d-canvas');
+      browserArgs.push('--disable-gpu');
+      
+      // Safe mode - add all compatibility options
+      if (argv.safeMode) {
+        browserArgs.push('--disable-web-security');
+        browserArgs.push('--disable-features=site-per-process');
+        browserArgs.push('--disable-features=IsolateOrigins');
+        browserArgs.push('--disable-site-isolation-trials');
+        browserArgs.push('--disable-features=TranslateUI');
+        browserArgs.push('--disable-breakpad');
+        browserArgs.push('--disable-sync');
+        browserArgs.push('--disable-background-networking');
+        browserArgs.push('--disable-default-apps');
+        browserArgs.push('--disable-extensions');
+        browserArgs.push('--disable-component-extensions-with-background-pages');
+        browserArgs.push('--disable-backgrounding-occluded-windows');
+        browserArgs.push('--disable-component-update');
+        browserArgs.push('--metrics-recording-only');
+        browserArgs.push('--mute-audio');
+        browserArgs.push('--no-default-browser-check');
+        browserArgs.push('--no-first-run');
+        browserArgs.push('--password-store=basic');
+      } else {
+        // Just add mute audio if not in safe mode
+        browserArgs.push('--mute-audio');
+      }
+      
+      // Linux compatibility mode - add extra args
+      if (argv.linuxCompatMode || os.platform() === 'linux') {
+        console.log(`[Instance ${instanceId}] Enabling Linux compatibility mode...`);
+        browserArgs.push('--disable-web-security');
+        browserArgs.push('--allow-running-insecure-content');
+        browserArgs.push('--disable-features=IsolateOrigins,site-per-process,SitePerProcess');
+        browserArgs.push('--flag-switches-begin');
+        browserArgs.push('--disable-site-isolation-trials');
+        browserArgs.push('--flag-switches-end');
+      }
+      
+      // Set up browser options with more robust error handling
+      const launchOptions = {
+        headless: argv.headless ? (argv.safeMode ? false : 'new') : false, // Don't use headless in safe mode
+        executablePath: chromePath || null, // Will use bundled Chromium if null
+        ignoreHTTPSErrors: true,
+        dumpio: false,
+        args: browserArgs
+      };
+      
+      // Check if we're running on Windows to add Windows-specific fixes
+      const isWindows = os.platform() === 'win32';
+      if (isWindows) {
+        console.log(`[Instance ${instanceId}] Detected Windows platform, applying specific optimizations...`);
         
-        if (proxyRetries >= maxProxyRetries) {
-          if (argv.allowDirectConnection) {
-            console.log(`[Instance ${instanceId}] Max proxy retries reached. Continuing with direct connection.`);
-            
-            // Reset args to remove any proxy settings
-            launchOptions.args = launchOptions.args.filter(arg => !arg.startsWith('--proxy-server='));
-            break;
-          } else {
-            console.error(`[Instance ${instanceId}] Max proxy retries reached and direct connections are not allowed. Stopping instance.`);
-            return; // Exit the function to stop this instance
+        // Add Windows-specific flags to prevent STATUS_ACCESS_VIOLATION
+        launchOptions.args.push('--disable-gpu-sandbox');
+        launchOptions.args.push('--no-sandbox');
+        launchOptions.args.push('--disable-setuid-sandbox');
+        
+        // Increase default browser timeout for Windows
+        launchOptions.timeout = 120000; // 2 minutes
+        
+        // Force processes to close properly on Windows
+        launchOptions.handleSIGINT = true;
+        launchOptions.handleSIGTERM = true;
+        launchOptions.handleSIGHUP = true;
+      }
+      
+      // Apply Windows-specific safe mode if enabled
+      if (isWindows && argv.winSafeMode) {
+        console.log(`[Instance ${instanceId}] Windows safe mode enabled. Using special configuration to prevent STATUS_ACCESS_VIOLATION...`);
+        
+        // Use a more conservative configuration
+        launchOptions.args.push('--disable-gpu');
+        launchOptions.args.push('--disable-software-rasterizer');
+        launchOptions.args.push('--disable-dev-shm-usage');
+        launchOptions.args.push('--disable-accelerated-2d-canvas');
+        launchOptions.args.push('--single-process');
+        launchOptions.args.push('--js-flags=--max-old-space-size=2048');
+        
+        // Disable features that might cause memory issues
+        launchOptions.args.push('--disable-features=site-per-process,IsolateOrigins,SitePerProcess');
+        
+        // Disable extensions for better stability
+        launchOptions.args.push('--disable-extensions');
+        
+        // Automatically disable headless mode if Windows safe mode is enabled
+        if (launchOptions.headless) {
+          console.log(`[Instance ${instanceId}] Disabling headless mode for Windows safe mode...`);
+          launchOptions.headless = false;
+          // Remove any headless flags
+          launchOptions.args = launchOptions.args.filter(arg => !arg.includes('--headless'));
+        }
+        
+        // Try to terminate any running Chrome processes before starting
+        try {
+          console.log(`[Instance ${instanceId}] Terminating existing Chrome processes...`);
+          execSync('taskkill /F /IM chrome.exe /T', { stdio: 'ignore' });
+        } catch (e) {
+          // Ignore errors - process might not exist
+        }
+      }
+      
+      // Add headless mode specific arguments if needed
+      if (argv.headless) {
+        // Fix for Chrome crashes in headless mode
+        console.log(`[Instance ${instanceId}] Using crash-resistant headless configuration`);
+        
+        // These prevent crashes in headless mode
+        launchOptions.args.push('--disable-gpu');
+        launchOptions.args.push('--disable-software-rasterizer');
+        launchOptions.args.push('--disable-dev-shm-usage');
+        launchOptions.args.push('--disable-accelerated-2d-canvas');
+        launchOptions.args.push('--no-first-run');
+        launchOptions.args.push('--no-zygote');
+        
+        // Only use single-process mode in minimal headless mode as it can cause issues
+        if (argv.minimalHeadless) {
+          launchOptions.args.push('--single-process');
+        }
+        
+        launchOptions.args.push('--disable-setuid-sandbox');
+        
+        // Fix for Trusted Type policy in headless mode
+        launchOptions.args.push('--disable-web-security');
+        launchOptions.args.push('--allow-running-insecure-content');
+        
+        // These help with Content Security Policy issues
+        launchOptions.args.push('--disable-features=IsolateOrigins,site-per-process');
+        launchOptions.args.push('--disable-site-isolation-trials');
+        
+        // Use minimal functionality in minimal headless mode
+        if (argv.minimalHeadless) {
+          console.log(`[Instance ${instanceId}] Using minimal headless mode for maximum stability`);
+          launchOptions.args.push('--blink-settings=imagesEnabled=true');
+          launchOptions.args.push('--disable-extensions');
+          launchOptions.args.push('--disable-component-extensions-with-background-pages');
+          launchOptions.args.push('--disable-default-apps');
+          launchOptions.args.push('--disable-translate');
+          launchOptions.args.push('--disable-sync');
+          launchOptions.args.push('--hide-scrollbars');
+          launchOptions.args.push('--metrics-recording-only');
+          launchOptions.args.push('--mute-audio');
+          launchOptions.args.push('--no-default-browser-check');
+          launchOptions.args.push('--no-experiments');
+          launchOptions.args.push('--no-pings');
+          launchOptions.args.push('--no-sandbox');
+        }
+        
+        // Additional memory settings to prevent crashes
+        launchOptions.args.push('--memory-pressure-off');
+        
+        // Switch to the appropriate headless mode implementation
+        if (argv.minimalHeadless) {
+          // Use classic headless mode for maximum compatibility
+          launchOptions.args.push('--headless');
+          launchOptions.headless = true;
+        } else {
+          // Try to detect the best headless mode
+          try {
+            const puppeteerVersion = require('puppeteer-extra/package.json').version;
+            if (parseInt(puppeteerVersion.split('.')[0]) >= 3) {
+              // New headless flag for newer versions of Puppeteer
+              launchOptions.headless = 'new';
+            } else {
+              // Classic headless for older versions
+              launchOptions.args.push('--headless');
+              launchOptions.headless = true;
+            }
+          } catch (e) {
+            // Default to new headless if version detection fails
+            launchOptions.headless = 'new';
           }
         }
       }
-    }
+      
+      // Add proxy if available
+      let proxyUrl = null;
+      if (proxyList.length > 0) {
+        proxyUrl = proxyList[Math.floor(Math.random() * proxyList.length)];
+        launchOptions.args.push(`--proxy-server=${proxyUrl}`);
+        console.log(`[Instance ${instanceId}] Using proxy: ${proxyUrl}`);
+      } else if (!argv.allowDirectConnection) {
+        console.error(`[Instance ${instanceId}] No proxies available and direct connections are not allowed. Stopping instance.`);
+        return; // Exit the function to stop this instance
+      } else {
+        console.log(`[Instance ${instanceId}] No proxies available. Running with direct connection.`);
+      }
+      
+      // Launch browser with retry logic
+      let retries = 0;
+      const maxRetries = 3;
+      let proxyError = false;
+      
+      while (!browser && retries < maxRetries) {
+        try {
+          console.log(`[Instance ${instanceId}] Launching browser (attempt ${retries + 1}/${maxRetries})...`);
+          browser = await puppeteer.launch(launchOptions);
+          break; // Success, exit retry loop
+        } catch (launchError) {
+          retries++;
+          logErrorDetails(launchError, `Browser Launch Error (Attempt ${retries})`);
+          
+          // Check if the error is related to proxy connection
+          if (launchError.message.includes('ERR_PROXY_CONNECTION_FAILED') || 
+              launchError.message.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
+              launchError.message.includes('ERR_SOCKS_CONNECTION_FAILED')) {
+            
+            proxyError = true;
+            console.error(`[Instance ${instanceId}] Proxy connection error detected. Trying without proxy...`);
+            
+            // Remove proxy settings
+            launchOptions.args = launchOptions.args.filter(arg => !arg.startsWith('--proxy-server='));
+            
+            if (!argv.allowDirectConnection) {
+              console.error(`[Instance ${instanceId}] Proxy connection failed and direct connection is not allowed. Stopping instance.`);
+              return; // Exit the function
+            }
+          }
+          // Additional handling for STATUS_ACCESS_VIOLATION
+          else if (launchError.message.includes('STATUS_ACCESS_VIOLATION')) {
+            console.error(`[Instance ${instanceId}] STATUS_ACCESS_VIOLATION detected. Applying emergency fixes...`);
+            
+            // Show special help for persistent STATUS_ACCESS_VIOLATION errors
+            if (retries >= 2) {
+              displayStatusAccessViolationHelp();
+            }
+            
+            // This is a serious Windows-specific memory access error
+            // Apply multiple fixes to recover
+            
+            // 1. Enable Windows-specific safe mode
+            console.log(`[Instance ${instanceId}] Enabling Windows safe mode...`);
+            
+            // Clear existing args that might conflict with safe mode
+            launchOptions.args = launchOptions.args.filter(arg => 
+              !arg.includes('--disable-features=') && 
+              !arg.includes('--enable-features=') && 
+              !arg.includes('--headless')
+            );
+            
+            // Add safe mode flags for Windows
+            launchOptions.args.push('--no-sandbox');
+            launchOptions.args.push('--disable-setuid-sandbox');
+            launchOptions.args.push('--disable-gpu');
+            launchOptions.args.push('--disable-gpu-sandbox');
+            launchOptions.args.push('--disable-software-rasterizer');
+            launchOptions.args.push('--disable-dev-shm-usage');
+            launchOptions.args.push('--disable-accelerated-2d-canvas');
+            
+            // Extreme fixes for persistent STATUS_ACCESS_VIOLATION
+            console.log(`[Instance ${instanceId}] Applying extreme fixes for persistent crashes...`);
+            launchOptions.args.push('--renderer-process-limit=1');
+            launchOptions.args.push('--disable-features=CalculateNativeWinOcclusion');
+            launchOptions.args.push('--disable-reading-from-canvas');
+            launchOptions.args.push('--disable-databases');
+            launchOptions.args.push('--disable-gpu-compositing');
+            launchOptions.args.push('--no-default-browser-check');
+            launchOptions.args.push('--no-experiments');
+            launchOptions.args.push('--no-pings');
+            
+            // Single process is high risk but can fix ACCESS_VIOLATION
+            if (retries >= 2) {
+              console.log(`[Instance ${instanceId}] Last attempt - using single-process mode (extreme/risky fix)...`);
+              launchOptions.args.push('--single-process');
+            }
+            
+            // 2. Try without headless mode if in headless mode
+            if (launchOptions.headless) {
+              console.log(`[Instance ${instanceId}] Switching to non-headless mode to avoid ACCESS_VIOLATION...`);
+              launchOptions.headless = false;
+              launchOptions.args = launchOptions.args.filter(arg => !arg.includes('--headless'));
+            }
+            
+            // 3. Try without a custom path on next attempt
+            if (launchOptions.executablePath && retries >= 1) {
+              console.log(`[Instance ${instanceId}] Using bundled Chromium to avoid ACCESS_VIOLATION issues...`);
+              launchOptions.executablePath = null;
+            }
+            
+            // 4. Add more memory headroom
+            launchOptions.args.push('--js-flags=--max-old-space-size=2048');
+            
+            // 5. Close any potentially running chrome processes (Windows specific)
+            try {
+              if (os.platform() === 'win32') {
+                console.log(`[Instance ${instanceId}] Attempting to terminate existing Chrome processes...`);
+                try {
+                  execSync('taskkill /F /IM chrome.exe /T', { stdio: 'ignore' });
+                } catch (e) {
+                  // Ignore errors - process might not exist
+                }
+                try {
+                  execSync('taskkill /F /IM "Google Chrome.exe" /T', { stdio: 'ignore' });
+                } catch (e) {
+                  // Ignore errors - process might not exist
+                }
+                
+                // Also try to kill chromium processes
+                try {
+                  execSync('taskkill /F /IM chromium.exe /T', { stdio: 'ignore' });
+                } catch (e) {
+                  // Ignore errors - process might not exist
+                }
+              }
+            } catch (killError) {
+              // Ignore any errors in process killing
+            }
 
-    // Launch browser with retry logic (if not already launched during proxy testing)
-    let retries = 0;
-    const maxRetries = 3;
-    let proxyError = false;
-    
-    while (!browser && retries < maxRetries) {
-      try {
-        console.log(`[Instance ${instanceId}] Launching browser (attempt ${retries + 1}/${maxRetries})...`);
-        browser = await puppeteer.launch(launchOptions);
-        break; // Success, exit retry loop
-      } catch (launchError) {
-        retries++;
-        logErrorDetails(launchError, `Browser Launch Error (Attempt ${retries})`);
-        
-        // Check if the error is related to proxy connection
-        if (launchError.message.includes('ERR_PROXY_CONNECTION_FAILED') || 
-            launchError.message.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
-            launchError.message.includes('ERR_SOCKS_CONNECTION_FAILED')) {
-          
-          proxyError = true;
-          console.error(`[Instance ${instanceId}] Proxy connection error detected. Trying without proxy...`);
-          
-          // Remove proxy settings
-          launchOptions.args = launchOptions.args.filter(arg => !arg.startsWith('--proxy-server='));
-          
-          if (!argv.allowDirectConnection) {
-            console.error(`[Instance ${instanceId}] Proxy connection failed and direct connection is not allowed. Stopping instance.`);
-            return; // Exit the function
-          }
-        }
-        // Additional handling for STATUS_ACCESS_VIOLATION
-        else if (launchError.message.includes('STATUS_ACCESS_VIOLATION')) {
-          console.error(`[Instance ${instanceId}] STATUS_ACCESS_VIOLATION detected. Adjusting launch parameters...`);
-          
-          // Enable safe mode automatically
-          if (!argv.safeMode) {
-            console.log(`[Instance ${instanceId}] Enabling safe mode automatically...`);
-            launchOptions.args.push('--disable-features=site-per-process');
-            launchOptions.args.push('--disable-web-security');
-            launchOptions.args.push('--disable-features=IsolateOrigins');
-            launchOptions.args.push('--disable-site-isolation-trials');
+            // Wait longer before retry for systems to stabilize
+            await new Promise(resolve => setTimeout(resolve, 10000));
           }
           
-          // Try without a custom path on next attempt
-          if (launchOptions.executablePath && retries >= 2) {
-            console.log(`[Instance ${instanceId}] Trying with bundled Chromium instead of custom path...`);
-            launchOptions.executablePath = null;
+          if (retries >= maxRetries) {
+            throw new Error(`Failed to launch browser after ${maxRetries} attempts: ${launchError.message}`);
           }
-        }
-        
-        if (retries >= maxRetries) {
-          throw new Error(`Failed to launch browser after ${maxRetries} attempts: ${launchError.message}`);
-        }
-        
-        // Wait before retry and try with different options if needed
-        console.log(`[Instance ${instanceId}] Retrying in 5 seconds...`);
-        
-        // If we've tried multiple times, try with default Chromium on last attempt
-        if (retries === maxRetries - 1) {
-          console.log(`[Instance ${instanceId}] Trying with default bundled Chromium on final attempt...`);
-          delete launchOptions.executablePath;
           
-          // Also add more compatibility flags as a last resort
-          console.log(`[Instance ${instanceId}] Adding additional compatibility flags...`);
-          launchOptions.args.push('--disable-features=TranslateUI');
-          launchOptions.args.push('--disable-breakpad');
-          launchOptions.args.push('--disable-sync');
-          launchOptions.args.push('--no-first-run');
-          launchOptions.args.push('--password-store=basic');
+          // Wait before retry and try with different options if needed
+          console.log(`[Instance ${instanceId}] Retrying in 5 seconds...`);
+          
+          // If we've tried multiple times, try with default Chromium on last attempt
+          if (retries === maxRetries - 1) {
+            console.log(`[Instance ${instanceId}] Trying with default bundled Chromium on final attempt...`);
+            delete launchOptions.executablePath;
+            
+            // Also add more compatibility flags as a last resort
+            console.log(`[Instance ${instanceId}] Adding additional compatibility flags...`);
+            launchOptions.args.push('--disable-features=TranslateUI');
+            launchOptions.args.push('--disable-breakpad');
+            launchOptions.args.push('--disable-sync');
+            launchOptions.args.push('--no-first-run');
+            launchOptions.args.push('--password-store=basic');
+          }
+          
+          await new Promise(resolve => setTimeout(resolve, 5000));
         }
-        
-        await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
 
@@ -1475,6 +1798,63 @@ async function runYouTubeViewer(instanceId, proxyList) {
     
     // Override problematic browser APIs
     await page.evaluateOnNewDocument((disableFingerprinting) => {
+      // Handle Content Security Policy and Trusted Types
+      try {
+        if (window.trustedTypes && window.trustedTypes.createPolicy) {
+          // Create a policy for trusted HTML evaluation
+          window.trustedTypes.createPolicy('youtube-viewer-policy', {
+            createHTML: (string) => string,
+            createScript: (string) => string,
+            createScriptURL: (string) => string
+          });
+          
+          // Add additional trusted types handling for headless mode
+          const policyNames = window.trustedTypes.getPolicyNames();
+          if (!policyNames.includes('default')) {
+            try {
+              window.trustedTypes.createPolicy('default', {
+                createHTML: (string) => string,
+                createScript: (string) => string,
+                createScriptURL: (string) => string
+              });
+            } catch (e) {
+              // Default policy might already exist or can't be created
+              console.log('Could not create default trusted type policy: ' + e.message);
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore errors if policy already exists or cannot be created
+        console.log('Error setting up Trusted Types policies: ' + e.message);
+      }
+      
+      // Mock Presentation API to prevent SecurityError
+      if (typeof window.PresentationRequest !== 'undefined') {
+        try {
+          window.PresentationRequest = class MockPresentationRequest {
+            constructor() {}
+            start() { return Promise.reject(new Error('Mocked PresentationRequest')); }
+            reconnect() { return Promise.reject(new Error('Mocked PresentationRequest')); }
+            getAvailability() { return Promise.resolve({ value: false }); }
+          };
+        } catch (e) {
+          console.log('Could not mock PresentationRequest: ' + e.message);
+        }
+      }
+      
+      // Mock chrome.cast API to prevent cast errors
+      if (typeof window.chrome === 'undefined') {
+        window.chrome = {};
+      }
+      if (!window.chrome.cast) {
+        window.chrome.cast = {
+          isAvailable: false,
+          initialize: function() {},
+          requestSession: function() {},
+          ApiConfig: function() {}
+        };
+      }
+      
       // Mock Notification API (always do this regardless of fingerprinting setting)
       if (typeof Notification === 'undefined') {
         window.Notification = class Notification {
@@ -1637,10 +2017,12 @@ async function runYouTubeViewer(instanceId, proxyList) {
       // If it's a video URL but browseChannel is enabled, extract the channel
       if (!isChannelUrl(channelUrl) && channelUrl.includes('watch?v=')) {
         console.log(`[Instance ${instanceId}] Video URL provided with channel browsing enabled. Will extract channel from video.`);
-        await page.goto(channelUrl, { waitUntil: 'networkidle2', timeout: 60000 });
         
-        // Wait for and click on the channel name to go to channel page
         try {
+          // Navigate to the video page with retries
+          await navigateWithRetries(page, channelUrl, instanceId);
+          
+          // Wait for and click on the channel name to go to channel page
           await page.waitForSelector('a.ytd-channel-name', { timeout: 30000 });
           channelUrl = await page.evaluate(() => {
             const channelLink = document.querySelector('a.ytd-channel-name');
@@ -1660,25 +2042,31 @@ async function runYouTubeViewer(instanceId, proxyList) {
       // If we have a channel URL, extract videos
       if (isChannelUrl(channelUrl) && videosToWatch.length === 0) {
         console.log(`[Instance ${instanceId}] Navigating to channel: ${channelUrl}`);
-        await page.goto(channelUrl + '/videos', { waitUntil: 'networkidle2', timeout: 60000 });
-        
-        // Extract videos from channel page
-        const channelVideos = await extractVideosFromChannel(page, maxVideosToWatch * 2);
-        
-        console.log(`[Instance ${instanceId}] Found ${channelVideos.length} videos on the channel.`);
-        
-        // Filter out already watched videos
-        videosToWatch = channelVideos.filter(video => 
-          !globalWatchedVideos.has(video.url) && !instanceWatchedVideos.has(video.url)
-        );
-        
-        // Shuffle the videos for random order
-        videosToWatch = videosToWatch.sort(() => Math.random() - 0.5);
-        
-        // Limit to max videos
-        videosToWatch = videosToWatch.slice(0, maxVideosToWatch);
-        
-        console.log(`[Instance ${instanceId}] Selected ${videosToWatch.length} videos to watch.`);
+        try {
+          // Navigate to channel videos page with retries
+          await navigateWithRetries(page, channelUrl + '/videos', instanceId);
+          
+          // Extract videos from channel page
+          const channelVideos = await extractVideosFromChannel(page);
+          
+          console.log(`[Instance ${instanceId}] Found ${channelVideos.length} videos on the channel.`);
+          
+          // Filter out already watched videos
+          videosToWatch = channelVideos.filter(video => 
+            !globalWatchedVideos.has(video.url) && !instanceWatchedVideos.has(video.url)
+          );
+          
+          // Shuffle the videos for random order
+          videosToWatch = videosToWatch.sort(() => Math.random() - 0.5);
+          
+          // Limit to max videos
+          videosToWatch = videosToWatch.slice(0, maxVideosToWatch);
+          
+          console.log(`[Instance ${instanceId}] Selected ${videosToWatch.length} videos to watch.`);
+        } catch (error) {
+          console.error(`[Instance ${instanceId}] Error navigating to channel: ${error.message}`);
+          return; // Exit this instance if we can't navigate to the channel
+        }
       }
     } else {
       // Single video mode
@@ -1716,26 +2104,13 @@ async function runYouTubeViewer(instanceId, proxyList) {
         console.log(`[Instance ${instanceId}] ${typeEmoji} Type: ${currentVideo.type.toUpperCase()}`);
       }
       
-      // Navigate to video
-      await page.goto(videoUrl, { 
-        waitUntil: 'networkidle2', 
-        timeout: 60000 
-      }).catch(async (err) => {
-        console.error(`[Instance ${instanceId}] Navigation error: ${err.message}`);
-        // Try again with different waitUntil strategy
-        console.log(`[Instance ${instanceId}] Retrying navigation with different settings...`);
-        try {
-          await page.goto(videoUrl, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 60000 
-          });
-          // Add extra wait time when using domcontentloaded
-          await page.waitForTimeout(5000);
-        } catch (retryErr) {
-          console.error(`[Instance ${instanceId}] Retry navigation also failed: ${retryErr.message}`);
-          throw retryErr; // Re-throw to be caught by outer try/catch
-        }
-      });
+      // Navigate to video with resilient navigation
+      try {
+        await navigateWithRetries(page, videoUrl, instanceId);
+      } catch (navigationError) {
+        console.error(`[Instance ${instanceId}] Failed to navigate to video after retries. Skipping to next video.`);
+        continue; // Skip to the next video
+      }
       
       // Wait for video player to load with better error handling
       try {
@@ -1751,25 +2126,13 @@ async function runYouTubeViewer(instanceId, proxyList) {
         } catch (altSelectorError) {
           // Try one more different approach - wait for any video element
           console.log(`[Instance ${instanceId}] Checking if page has any video element...`);
-          const hasVideo = await page.evaluate(() => {
+          const hasVideo = await safeEvaluate(page, () => {
             return document.querySelector('video') !== null;
           });
           
           if (!hasVideo) {
-            console.error(`[Instance ${instanceId}] Could not find any video element on the page.`);
-            
-            // Take a screenshot to help diagnose the issue if verbose errors enabled
-            if (argv.verboseErrors) {
-              try {
-                const screenshotPath = `error-instance-${instanceId}-${Date.now()}.png`;
-                await page.screenshot({ path: screenshotPath });
-                console.log(`[Instance ${instanceId}] Error screenshot saved to ${screenshotPath}`);
-              } catch (screenshotError) {
-                console.error(`[Instance ${instanceId}] Could not save error screenshot: ${screenshotError.message}`);
-              }
-            }
-            
-            throw new Error('No video player found on page');
+            console.error(`[Instance ${instanceId}] Could not find any video element on the page. Skipping to next video.`);
+            continue; // Skip to next video
           } else {
             console.log(`[Instance ${instanceId}] Found video element with alternative method.`);
           }
@@ -1845,7 +2208,11 @@ async function runYouTubeViewer(instanceId, proxyList) {
           if (Math.random() < behavior.scrollProbability) {
             console.log(`[Instance ${instanceId}] Scrolling slightly...`);
             await page.evaluate(() => {
-              window.scrollBy(0, (Math.random() * 400) - 200);
+              try {
+                window.scrollBy(0, (Math.random() * 400) - 200);
+              } catch (e) {
+                // Ignore scrolling errors
+              }
             });
             await randomDelay(500, 2000);
           }
@@ -1853,9 +2220,13 @@ async function runYouTubeViewer(instanceId, proxyList) {
           if (Math.random() < behavior.volumeChangeProbability) {
             console.log(`[Instance ${instanceId}] Adjusting volume...`);
             await page.evaluate(() => {
-              const video = document.querySelector('video');
-              if (video) {
-                video.volume = Math.min(Math.max(video.volume + (Math.random() * 0.2 - 0.1), 0), 0.5);
+              try {
+                const video = document.querySelector('video');
+                if (video) {
+                  video.volume = Math.min(Math.max(video.volume + (Math.random() * 0.2 - 0.1), 0), 0.5);
+                }
+              } catch (e) {
+                // Ignore volume errors
               }
             });
           }
@@ -1863,14 +2234,18 @@ async function runYouTubeViewer(instanceId, proxyList) {
           if (Math.random() < behavior.pausePlayProbability) {
             console.log(`[Instance ${instanceId}] Toggling pause/play...`);
             await page.evaluate(() => {
-              const video = document.querySelector('video');
-              if (video) {
-                if (video.paused) {
-                  video.play();
-                } else {
-                  video.pause();
-                  setTimeout(() => video.play(), 1000 + Math.random() * 2000);
+              try {
+                const video = document.querySelector('video');
+                if (video) {
+                  if (video.paused) {
+                    video.play().catch(() => {});
+                  } else {
+                    video.pause();
+                    setTimeout(() => video.play().catch(() => {}), 1000 + Math.random() * 2000);
+                  }
                 }
+              } catch (e) {
+                // Ignore pause/play errors
               }
             });
             await randomDelay(1000, 3000);
@@ -1879,21 +2254,33 @@ async function runYouTubeViewer(instanceId, proxyList) {
           if (Math.random() < behavior.commentScrollProbability) {
             console.log(`[Instance ${instanceId}] Scrolling comments...`);
             await page.evaluate(() => {
-              const commentsSection = document.querySelector('#comments');
-              if (commentsSection) {
-                commentsSection.scrollIntoView({ behavior: 'smooth' });
-                setTimeout(() => {
-                  window.scrollBy(0, Math.random() * 300);
-                }, 1000);
+              try {
+                const commentsSection = document.querySelector('#comments');
+                if (commentsSection) {
+                  commentsSection.scrollIntoView({ behavior: 'smooth' });
+                  setTimeout(() => {
+                    try {
+                      window.scrollBy(0, Math.random() * 300);
+                    } catch (e) {
+                      // Ignore scrolling errors
+                    }
+                  }, 1000);
+                }
+              } catch (e) {
+                // Ignore comment scrolling errors
               }
             });
             await randomDelay(2000, 5000);
             
             // Scroll back to video after viewing comments
             await page.evaluate(() => {
-              const videoPlayer = document.querySelector('.html5-video-container');
-              if (videoPlayer) {
-                videoPlayer.scrollIntoView({ behavior: 'smooth' });
+              try {
+                const videoPlayer = document.querySelector('.html5-video-container');
+                if (videoPlayer) {
+                  videoPlayer.scrollIntoView({ behavior: 'smooth' });
+                }
+              } catch (e) {
+                // Ignore scrolling errors
               }
             });
           }
@@ -1923,120 +2310,37 @@ async function runYouTubeViewer(instanceId, proxyList) {
       // Add a delay between videos
       if (videoIndex < videosToWatch.length - 1) {
         const delayBetweenVideos = Math.floor(3000 + Math.random() * 7000);
-        console.log(`[Instance ${instanceId}] Waiting ${Math.floor(delayBetweenVideos/1000)}s before next video...`);
-        await randomDelay(delayBetweenVideos, delayBetweenVideos + 1000);
+        console.log(`[Instance ${instanceId}] Waiting between videos: ${delayBetweenVideos}ms`);
+        await randomDelay(delayBetweenVideos, delayBetweenVideos + 5000);
       }
     }
-    
-    console.log(`[Instance ${instanceId}] 🎉 Finished watching playlist of ${videoIndex} videos.`);
-    
   } catch (error) {
-    console.error(`[Instance ${instanceId}] Error:`, error.message);
+    console.error(`[Instance ${instanceId}] Error running YouTube viewer:`, error.message);
   } finally {
-    // Clear intervals
-    if (adCheckInterval) {
-      clearInterval(adCheckInterval);
-    }
-    
-    if (playbackCheckInterval) {
-      clearInterval(playbackCheckInterval);
-    }
-    
-    // Close browser
     if (browser) {
-      console.log(`[Instance ${instanceId}] Closing browser...`);
       await browser.close();
     }
   }
 }
 
-// Run multiple instances
-async function main() {
+// Main function to run the YouTube viewer instances
+async function runYouTubeViewers() {
   try {
-    // Auto-detect problem with STATUS_ACCESS_VIOLATION from previous runs
-    const autoEnableSafeMode = () => {
-      if (fs.existsSync('./error.log')) {
-        const errorLog = fs.readFileSync('./error.log', 'utf8');
-        if (errorLog.includes('STATUS_ACCESS_VIOLATION') && !argv.safeMode) {
-          console.log('⚠️ STATUS_ACCESS_VIOLATION detected in previous runs. Automatically enabling --safeMode');
-          argv.safeMode = true;
-        }
-      }
-    };
-    
-    // Try to auto-detect issues
-    try {
-      autoEnableSafeMode();
-    } catch (e) {
-      // Ignore errors in auto detection
-    }
-    
-    // Detect Chrome path once before starting
-    const chromePath = argv.customChromePath || findChromePath();
-    if (chromePath) {
-      process.env.PUPPETEER_EXECUTABLE_PATH = chromePath;
-    }
-    
-    // Print system info
-    console.log('\n======== System Information ========');
-    console.log(`Platform: ${os.platform()} ${os.release()}`);
-    console.log(`Architecture: ${os.arch()}`);
-    console.log(`Node version: ${process.version}`);
-    console.log(`Memory: ${Math.round(os.totalmem() / (1024 * 1024 * 1024))} GB`);
-    console.log(`Chrome path: ${process.env.PUPPETEER_EXECUTABLE_PATH || 'Using bundled Chromium'}`);
-    console.log('====================================\n');
-    
-    // Setup proxy list once before starting instances
     const proxyList = await setupProxies();
+    const instances = argv.instances;
     
-    console.log(`
-    🎬 Starting YouTube Viewer with ${argv.instances} instances
-    🎯 Target: ${argv.url}
-    ${argv.browseChannel || isChannelUrl(argv.url) 
-      ? `📺 Mode: Channel Browsing (max ${argv.maxVideos} videos per instance)
-    📊 Video types: ${argv.includeRegular ? '✅ Regular' : '❌ Regular'} | ${argv.includeShorts ? '✅ Shorts' : '❌ Shorts'} | ${argv.includeLive ? '✅ Live' : '❌ Live'}` 
-      : '📺 Mode: Single Video'}
-    ⏱️ Watch duration: ${argv.minDuration}-${argv.maxDuration} seconds
-    🌐 Proxies: ${proxyList.length > 0 ? `${proxyList.length} proxies loaded` : 'No proxies used'}
-    🖥️ Browser: ${process.env.PUPPETEER_EXECUTABLE_PATH ? 'System Chrome' : 'Bundled Chromium'}
-    `);
+    console.log(`Starting ${instances} YouTube viewer instances...`);
     
-    const instances = Array.from({ length: argv.instances }, (_, i) => i + 1);
-    
-    // Run instances with a slight delay between each
-    for (const instanceId of instances) {
-      runYouTubeViewer(instanceId, proxyList);
-      await randomDelay(3000, 10000); // 3-10 second delay between instance launches
+    const promises = [];
+    for (let i = 0; i < instances; i++) {
+      promises.push(runYouTubeViewer(i + 1, proxyList));
     }
+    
+    await Promise.all(promises);
   } catch (error) {
-    logErrorDetails(error, 'Main Process Error');
-    
-    // Save error to file for future reference
-    try {
-      const errorDetails = `Error Time: ${new Date().toISOString()}\nError: ${error.message}\n${error.stack || 'No stack trace'}\n\n`;
-      fs.appendFileSync('./error.log', errorDetails);
-      console.error('Error details saved to error.log');
-    } catch (e) {
-      console.error('Could not save error details to file:', e.message);
-    }
-    
-    console.error('Program terminated due to error. Please check the logs above for details.');
-    process.exit(1);
+    console.error('Error running YouTube viewers:', error.message);
   }
 }
 
-// Intercept unhandled errors
-process.on('uncaughtException', (error) => {
-  logErrorDetails(error, 'Uncaught Exception');
-  console.error('An uncaught exception occurred. Program will continue but may be unstable.');
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('\n======== Unhandled Promise Rejection ========');
-  console.error('Promise:', promise);
-  console.error('Reason:', reason);
-  console.error('============================================\n');
-  console.error('An unhandled promise rejection occurred. Program will continue but may be unstable.');
-});
-
-main(); 
+// Run the main function
+runYouTubeViewers();
