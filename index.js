@@ -1768,18 +1768,19 @@ async function runYouTubeViewer(instanceId, proxyList) {
     
     // Set page error handling with filtering
     page.on('error', err => {
-      if (!isIgnorableError(err.message) || argv.verboseErrors) {
+      if (argv.verboseErrors && !isIgnorableError(err.message)) {
         console.error(`[Instance ${instanceId}] Page error: ${err.message}`);
       }
     });
     
     page.on('pageerror', err => {
-      if (!isIgnorableError(err.message) || argv.verboseErrors) {
-        // console.error(`[Instance ${instanceId}] Page console error: ${err.message}`);
+      // Only log errors if verboseErrors is explicitly enabled
+      if (argv.verboseErrors && !isIgnorableError(err.message)) {
+        console.error(`[Instance ${instanceId}] Page console error: ${err.message}`);
       }
     });
     
-    // Handle console messages
+    // Handle console messages only if verbose errors are enabled
     if (argv.verboseErrors) {
       page.on('console', msg => {
         if (msg.type() === 'error' || msg.type() === 'warning') {
@@ -2140,9 +2141,31 @@ async function runYouTubeViewer(instanceId, proxyList) {
       }
       
       // Get actual video title from the page
-      const actualTitle = await page.evaluate(() => {
-        const titleElement = document.querySelector('h1.ytd-watch-metadata, h1.title');
-        return titleElement ? titleElement.textContent.trim() : 'Unknown Title';
+      const actualTitle = await safeEvaluate(page, () => {
+        // Try multiple possible selectors for the video title
+        const selectors = [
+          'h1.ytd-watch-metadata', // Current YouTube layout
+          'h1.title', // Alternative format
+          '#title h1', // Another variation
+          '#title', // Simplified selector
+          '#container h1', // Container title
+          'ytd-watch-metadata #title', // Specific structure
+          '#above-the-fold #title', // Above the fold structure
+          // Most general selector as fallback
+          'h1', 
+          // Text content of the title element in the document head as final fallback
+          document.querySelector('title') ? document.querySelector('title').textContent.replace(' - YouTube', '') : null
+        ];
+        
+        // Try each selector until we find one that works
+        for (const selector of selectors) {
+          const element = document.querySelector(selector);
+          if (element && element.textContent && element.textContent.trim()) {
+            return element.textContent.trim();
+          }
+        }
+        
+        return 'Unknown Title';
       });
       
       console.log(`[Instance ${instanceId}] 📺 Actual Title: ${actualTitle}`);
