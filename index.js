@@ -1775,7 +1775,7 @@ async function runYouTubeViewer(instanceId, proxyList) {
     
     page.on('pageerror', err => {
       if (!isIgnorableError(err.message) || argv.verboseErrors) {
-        console.error(`[Instance ${instanceId}] Page console error: ${err.message}`);
+        // console.error(`[Instance ${instanceId}] Page console error: ${err.message}`);
       }
     });
     
